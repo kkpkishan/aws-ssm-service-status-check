@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFormation Template to deploy the Lambda function for checking service statuses and sending notifications.
+
+Parameters:
+  SNSArn:
+    Type: String
+    Description: ARN of the SNS topic for notifications
+
+  ServiceNames:
+    Type: String
+    Description: Comma-separated list of service names to check (e.g., nginx,mysql)
+
+Resources:
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:DescribeInstanceInformation
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeRegions
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  ServiceStatusCheckLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ServiceStatusCheckLambda
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import logging
+          import time
+          from concurrent.futures import ThreadPoolExecutor
+
+          # Set up logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize clients
+          ssm_client = boto3.client('ssm')
+          sns_client = boto3.client('sns')
+          ec2_client = boto3.client('ec2')
+
+          # Get environment variables
+          SNS_TOPIC_ARN = os.getenv('SNS_TOPIC_ARN')
+          SERVICE_NAMES = os.getenv('SERVICE_NAMES', '').split(',')
+
+          def get_ssm_instances():
+              regions = [region['RegionName'] for region in boto3.client('ec2').describe_regions()['Regions']]
+              instances = []
+              for region in regions:
+                  regional_ssm = boto3.client('ssm', region_name=region)
+                  try:
+                      paginator = regional_ssm.get_paginator('describe_instance_information')
+                      for page in paginator.paginate():
+                          for instance in page['InstanceInformationList']:
+                              instance['RegionName'] = region
+                              instances.append(instance)
+                  except Exception as e:
+                      logger.error(f"Error retrieving SSM instances in {region}: {e}")
+              return instances
+
+          def get_instance_details(instance_id, region):
+              try:
+                  ec2 = boto3.client('ec2', region_name=region)
+                  response = ec2.describe_instances(InstanceIds=[instance_id])
+                  instance = response['Reservations'][0]['Instances'][0]
+                  private_ip = instance.get('PrivateIpAddress', 'N/A')
+                  public_ip = instance.get('PublicIpAddress', 'N/A')
+                  name_tag = next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), 'N/A')
+                  return private_ip, public_ip, name_tag
+              except Exception as e:
+                  logger.error(f"Error fetching instance details for {instance_id} in {region}: {e}")
+                  return 'N/A', 'N/A', 'N/A'
+
+          def execute_service_check(instance_id, service_name):
+              try:
+                  command = f"systemctl is-active {service_name} || echo {service_name} not running"
+                  response = ssm_client.send_command(
+                      InstanceIds=[instance_id],
+                      DocumentName="AWS-RunShellScript",
+                      Parameters={"commands": [command]},
+                  )
+                  command_id = response['Command']['CommandId']
+
+                  for _ in range(10):
+                      time.sleep(2)
+                      invocation = ssm_client.get_command_invocation(
+                          CommandId=command_id,
+                          InstanceId=instance_id
+                      )
+                      status = invocation['Status']
+                      if status == 'Success':
+                          return invocation.get('StandardOutputContent', '').strip()
+                      elif status in ['Failed', 'Cancelled', 'TimedOut']:
+                          return f"Service check command failed with status: {status}"
+                  return "Command execution did not complete in the expected time."
+              except Exception as e:
+                  logger.error(f"Error checking service {service_name} on instance {instance_id}: {e}")
+                  return f"Error checking service {service_name}"
+
+          def process_instance(instance, services):
+              instance_id = instance['InstanceId']
+              region = instance['RegionName']
+              private_ip, public_ip, name_tag = get_instance_details(instance_id, region)
+              instance_status = []
+
+              for service in services:
+                  status = execute_service_check(instance_id, service)
+                  instance_status.append({
+                      "service": service,
+                      "status": status
+                  })
+
+              return {
+                  "instance_id": instance_id,
+                  "region": region,
+                  "private_ip": private_ip if private_ip != 'N/A' else None,
+                  "public_ip": public_ip if public_ip != 'N/A' else None,
+                  "name": name_tag,
+                  "status": instance_status
+              }
+
+          def send_sns_notification(instance_data):
+              try:
+                  message = ""
+                  for instance in instance_data:
+                      message += f"Instance Name: {instance['name']}\n"
+                      message += f"Instance ID: {instance['instance_id']}\n"
+                      message += f"Region: {instance['region']}\n"
+                      if instance['private_ip']:
+                          message += f"Private IP: {instance['private_ip']}\n"
+                      if instance['public_ip']:
+                          message += f"Public IP: {instance['public_ip']}\n"
+                      for service in instance['status']:
+                          message += f"Service {service['service']}: {service['status']}\n"
+                      message += "\n"
+
+                  sns_client.publish(
+                      TopicArn=SNS_TOPIC_ARN,
+                      Message=message,
+                      Subject="Service Status Report"
+                  )
+                  logger.info("SNS notification sent successfully.")
+              except Exception as e:
+                  logger.error(f"Error sending SNS notification: {e}")
+
+          def lambda_handler(event, context):
+              logger.info(f"Event: {json.dumps(event)}")
+              if not SNS_TOPIC_ARN or not SERVICE_NAMES:
+                  logger.error("Environment variables SNS_TOPIC_ARN or SERVICE_NAMES not set.")
+                  return
+
+              logger.info("Fetching SSM instances from all regions.")
+              ssm_instances = get_ssm_instances()
+              logger.info(f"Found {len(ssm_instances)} SSM managed instances.")
+
+              linux_instances = [
+                  {
+                      "InstanceId": instance['InstanceId'],
+                      "RegionName": instance['RegionName']
+                  }
+                  for instance in ssm_instances if instance['PlatformType'] == 'Linux'
+              ]
+
+              logger.info(f"Found {len(linux_instances)} Linux instances.")
+
+              if len(linux_instances) > 2:
+                  with ThreadPoolExecutor() as executor:
+                      results = list(executor.map(lambda instance: process_instance(instance, SERVICE_NAMES), linux_instances))
+              else:
+                  results = [process_instance(instance, SERVICE_NAMES) for instance in linux_instances]
+
+              logger.info("All instances processed. Sending SNS notification.")
+              send_sns_notification(results)
+              logger.info("Lambda execution completed.")
+
+      Timeout: 300
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SNSArn
+          SERVICE_NAMES: !Ref ServiceNames
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: "/aws/lambda/ServiceStatusCheckLambda"
+      RetentionInDays: 14
+
+Outputs:
+  LambdaFunctionName:
+    Description: Name of the deployed Lambda function
+    Value: !Ref ServiceStatusCheckLambda
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for notifications
+    Value: !Ref SNSArn
