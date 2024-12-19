@@ -1,0 +1,1 @@
+# aws-ssm-service-status-check
